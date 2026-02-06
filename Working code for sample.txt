@@ -1,0 +1,168 @@
+import streamlit as st
+import pandas as pd
+import google.generativeai as genai
+from PIL import Image
+import json
+import sqlite3
+import os
+
+# --- 1. CONFIGURATION ---
+# Using the 2026 Gemini 3 Flash model for superior accuracy
+MODEL_NAME = 'gemini-3-flash-preview' 
+API_KEY = os.getenv("GEMINI_API_KEY") 
+
+if API_KEY:
+    genai.configure(api_key=API_KEY)
+else:
+    st.warning("⚠️ API Key not found in Environment. Please enter it in the sidebar.")
+
+# --- 2. DATABASE UTILITY ---
+def load_schemes_from_db():
+    """Connects to SQLite and retrieves the scheme library."""
+    try:
+        conn = sqlite3.connect('schemes.db')
+        df = pd.read_sql_query("SELECT * FROM schemes", conn)
+        conn.close()
+        return df
+    except Exception as e:
+        st.error("🚨 schemes.db not found! Please run your database creation script first.")
+        return pd.DataFrame()
+
+# --- 3. CORE AI FUNCTIONS ---
+def process_document(image):
+    """Uses Gemini 3 Flash to perform high-accuracy OCR."""
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        prompt = "Perform high-accuracy OCR on this document. Extract every detail exactly as written."
+        response = model.generate_content([prompt, image])
+        return response.text if response else ""
+    except Exception as e:
+        st.error(f"OCR Error: {e}")
+        return ""
+
+def extract_structured_data(aadhaar_text, income_text, marksheet_text):
+    """Uses reasoning to create a clean JSON profile with keywords for SQL matching."""
+    try:
+        # We use a system instruction for 100% reliability in JSON output
+        model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            system_instruction="You are a data extraction specialist. Output ONLY raw JSON."
+        )
+        
+        prompt = f"""
+        Merge the following document data into a single user profile:
+        AADHAAR: {aadhaar_text}
+        INCOME: {income_text}
+        MARKSHEET: {marksheet_text}
+
+        Requirements:
+        1. 'income' must be an integer.
+        2. 'education' must be one of: [10th Pass, 12th Pass, Graduate, Post Graduate].
+        3. 'keywords' should be 5 tags reflecting their background (e.g., student, agriculture, female, rural).
+
+        Return this structure:
+        {{
+            "name": "Full Name",
+            "income": 0,
+            "education": "Status",
+            "category": "General/SC/ST/OBC",
+            "state": "State",
+            "keywords": ["tag1", "tag2"]
+        }}
+        """
+        response = model.generate_content(prompt)
+        
+        # Robust JSON Cleaning
+        raw_text = response.text.strip()
+        if "```json" in raw_text:
+            raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_text:
+            raw_text = raw_text.split("```")[1].split("```")[0].strip()
+            
+        return json.loads(raw_text)
+    except Exception as e:
+        st.error(f"Reasoning Error: {e}")
+        return None
+
+# --- 4. MATCHING LOGIC ---
+def get_match_score(user_data, scheme):
+    """Calculates eligibility based on SQL data and AI-extracted keywords."""
+    score = 0
+    
+    # Financial Check (40 pts)
+    if user_data['income'] <= scheme['income_limit']:
+        score += 40
+        
+    # Education Check (20 pts)
+    if scheme['education_req'] == 'Any' or user_data['education'] == scheme['education_req']:
+        score += 20
+    
+    # Keyword Matching (40 pts) - The AI-to-SQL Bridge
+    user_tags = set([k.lower() for k in user_data.get('keywords', [])])
+    db_tags = set([k.strip().lower() for k in scheme['keywords'].split(',')])
+    
+    matches = user_tags.intersection(db_tags)
+    score += min(40, len(matches) * 15)
+    
+    return min(100, round(score))
+
+# --- 5. STREAMLIT INTERFACE ---
+st.set_page_config(page_title="Gemini 3 Subsidy Finder", page_icon="🏦")
+
+# Sidebar
+with st.sidebar:
+    st.title("Settings")
+    user_api_key = st.text_input("Enter Gemini API Key", type="password")
+    if user_api_key:
+        genai.configure(api_key=user_api_key)
+    st.info("Powered by Gemini 3 Flash & SQLite")
+
+st.title("🏦 AI Government Subsidy Recommender")
+st.write("Upload your ID, Income, and Marksheet to find matching schemes.")
+
+# Layout
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    st.subheader("📤 Document Portal")
+    f1 = st.file_uploader("Aadhaar Card", type=['jpg', 'png', 'jpeg'])
+    f2 = st.file_uploader("Income Certificate", type=['jpg', 'png', 'jpeg'])
+    f3 = st.file_uploader("Marksheet", type=['jpg', 'png', 'jpeg'])
+    
+    if st.button("🔍 Run AI Analysis", type="primary"):
+        if f1 and f2 and f3:
+            with st.spinner("Gemini 3 is analyzing documents..."):
+                # 1. High-Accuracy OCR
+                t1 = process_document(Image.open(f1))
+                t2 = process_document(Image.open(f2))
+                t3 = process_document(Image.open(f3))
+                
+                # 2. Profile Extraction
+                profile = extract_structured_data(t1, t2, t3)
+                
+                if profile:
+                    st.session_state.profile = profile
+                    # 3. SQL Matching
+                    db_schemes = load_schemes_from_db()
+                    results = []
+                    for _, row in db_schemes.iterrows():
+                        results.append({**row.to_dict(), "match": get_match_score(profile, row)})
+                    
+                    st.session_state.results = sorted(results, key=lambda x: x['match'], reverse=True)
+        else:
+            st.warning("Please upload all three documents.")
+
+# Results Display
+with col2:
+    if 'profile' in st.session_state:
+        st.subheader("👤 User Profile")
+        st.json(st.session_state.profile)
+
+if 'results' in st.session_state:
+    st.divider()
+    st.subheader("🏆 Recommended Schemes")
+    for res in st.session_state.results:
+        with st.expander(f"{res['name']} — {res['match']}% Match"):
+            st.write(f"**Benefit:** {res['benefits']}")
+            st.write(f"**Criteria:** {res['criteria']}")
+            st.progress(res['match'] / 100)
